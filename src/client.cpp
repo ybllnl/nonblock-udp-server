@@ -6,10 +6,17 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include "network_util.h"
+#include <errno.h>
 
-#define SEND_BUFFER_SIZE 1472
-#define RECV_BUFFER_SIZE 65507
-#define SERVER_PORT 8080
+#define NON_BLOCKING // for editor convenience, remove after coding finished
+//#undef NON_BLOCKING
+
+inline void process_message(char* buffer){
+    // TODO: process message
+    return;
+}
+
 int main() {
     int socket_fd;
     char buffer[RECV_BUFFER_SIZE];
@@ -26,6 +33,10 @@ int main() {
     client_addr.sin_family = AF_INET;
     client_addr.sin_port = htons(0); // 0 means ephemeral port
     client_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+#ifdef NON_BLOCKING
+    set_non_blocking(socket_fd);
+#endif
 
 
 
@@ -47,6 +58,47 @@ int main() {
     strcpy(buffer, message);
 
     sendto(socket_fd, buffer, strlen(message), 0, (struct sockaddr*)&server_addr, server_addr_len);
+#ifdef NON_BLOCKING
+
+    int epoll_fd = epoll_create1(0);
+    if(epoll_fd == -1){
+        perror("epoll_create1");
+        exit(1);
+    }
+
+    add_socket_to_epoll(epoll_fd, socket_fd);
+    struct epoll_event events[MAX_EVENTS];
+
+    printf("Using non-blocking client\n");
+    while(true){
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        for(int i = 0; i < num_events; i++){
+            if(events[i].data.fd == socket_fd){
+                printf("Data is ready to be read\n");
+                int recv_len = recvfrom(socket_fd, buffer, RECV_BUFFER_SIZE, 0, (struct sockaddr*)&server_addr, &server_addr_len);
+                if(recv_len > 0){
+                    printf("Received %d bytes from server\n", recv_len);
+                    printf("Message: %s\n", buffer);
+                    process_message(buffer);
+                }else if(recv_len == 0){
+                    // UDP should not happen
+                }else{
+                    if(errno == EAGAIN || errno == EWOULDBLOCK){
+                        printf("No data to read\n");
+                    }else{
+                        perror("recvfrom");
+                        exit(1);
+                    }
+                }
+            }
+        }
+    }
+#else
+    printf("Using blocking client\n");
+    while(true){
+
+    }
+#endif
     
     close(socket_fd);
     return 0;
