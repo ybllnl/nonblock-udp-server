@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "network_util.h"
 #include <errno.h>
+#include "orderbook.h"
 
 #define NON_BLOCKING // for editor convenience, remove after coding finished
 //#undef NON_BLOCKING
@@ -18,34 +19,74 @@ inline void process_message(char* buffer){
 }
 
 int main() {
-    int socket_fd;
-    char buffer[RECV_BUFFER_SIZE];
+    int socket_primary_fd;
+    int socket_backup_fd;
+    char primary_buffer[RECV_BUFFER_SIZE];
+    char backup_buffer[RECV_BUFFER_SIZE];
 
     // create socket
-    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socket_fd < 0) {
+    socket_primary_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_primary_fd < 0) {
         perror("socket");
         exit(1);
     }
 
-    struct sockaddr_in client_addr;
-    memset(&client_addr, 0, sizeof(client_addr));
-    client_addr.sin_family = AF_INET;
-    client_addr.sin_port = htons(0); // 0 means ephemeral port
-    client_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    socket_backup_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_backup_fd < 0) {
+        perror("socket");
+        exit(1);
+    }
 
+    struct sockaddr_in primary_client_addr;
+    memset(&primary_client_addr, 0, sizeof(primary_client_addr));
+    primary_client_addr.sin_family = AF_INET;
+    primary_client_addr.sin_port = htons(MULTICAST_PORT_PRIMARY_RECEIVER);
+    primary_client_addr.sin_addr.s_addr = INADDR_ANY;
+
+    struct sockaddr_in backup_client_addr;
+    memset(&backup_client_addr, 0, sizeof(backup_client_addr));
+    backup_client_addr.sin_family = AF_INET;
+    backup_client_addr.sin_port = htons(MULTICAST_PORT_BACKUP_RECEIVER);
+    backup_client_addr.sin_addr.s_addr = INADDR_ANY;
+
+    // enable port and address reuse
+    int reuse = 1;
+    if(setsockopt(socket_primary_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0){
+        perror("setsockopt reuse primary");
+        exit(1);
+    }
+    if(setsockopt(socket_backup_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0){
+        perror("setsockopt reuse backup");
+        exit(1);
+    }
 #ifdef NON_BLOCKING
-    set_non_blocking(socket_fd);
+    set_non_blocking(socket_primary_fd);
+    set_non_blocking(socket_backup_fd);
 #endif
 
 
 
-    if(bind(socket_fd, (struct sockaddr*)&client_addr, sizeof(client_addr)) < 0) {
+    if(bind(socket_primary_fd, (struct sockaddr*)&primary_client_addr, sizeof(primary_client_addr)) < 0) {
         perror("bind");
         exit(1);
     }
 
-    printf("Client is listening on port %d\n", ntohs(client_addr.sin_port));
+    if(bind(socket_backup_fd, (struct sockaddr*)&backup_client_addr, sizeof(backup_client_addr)) < 0) {
+        perror("bind");
+        exit(1);
+    }
+
+    // join multicast group
+    ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr(MULTICAST_IP_PRIMARY);
+    mreq.imr_interface.s_addr = INADDR_ANY;
+    if(setsockopt(socket_primary_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        perror("failed to join primary multicast group");
+        exit(1);
+    }
+
+    printf("Client is listening on port %d\n", ntohs(primary_client_addr.sin_port));
+    printf("Client is listening on port %d\n", ntohs(backup_client_addr.sin_port));
 
     struct sockaddr_in server_addr;
     socklen_t server_addr_len = sizeof(server_addr);
@@ -55,9 +96,9 @@ int main() {
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     const char* message = "Hello, server!";
-    strcpy(buffer, message);
+    strcpy(primary_buffer, message);
 
-    sendto(socket_fd, buffer, strlen(message), 0, (struct sockaddr*)&server_addr, server_addr_len);
+    sendto(socket_primary_fd, primary_buffer, strlen(message), 0, (struct sockaddr*)&server_addr, server_addr_len);
 #ifdef NON_BLOCKING
 
     int epoll_fd = epoll_create1(0);
@@ -66,29 +107,41 @@ int main() {
         exit(1);
     }
 
-    add_socket_to_epoll(epoll_fd, socket_fd);
+    add_socket_to_epoll(epoll_fd, socket_primary_fd);
+    add_socket_to_epoll(epoll_fd, socket_backup_fd);
     struct epoll_event events[MAX_EVENTS];
 
     printf("Using non-blocking client\n");
     while(true){
+        printf("epoll_wait\n");
         int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         for(int i = 0; i < num_events; i++){
-            if(events[i].data.fd == socket_fd){
-                printf("Data is ready to be read\n");
-                int recv_len = recvfrom(socket_fd, buffer, RECV_BUFFER_SIZE, 0, (struct sockaddr*)&server_addr, &server_addr_len);
-                if(recv_len > 0){
-                    printf("Received %d bytes from server\n", recv_len);
-                    printf("Message: %s\n", buffer);
-                    process_message(buffer);
-                }else if(recv_len == 0){
-                    // UDP should not happen
+            char* buffer;
+            int socket_fd;
+            if(events[i].data.fd == socket_primary_fd){
+                buffer = primary_buffer;
+                socket_fd = socket_primary_fd;
+            }else if(events[i].data.fd == socket_backup_fd){
+                buffer = backup_buffer;
+                socket_fd = socket_backup_fd;
+            }else{
+                perror("epoll_wait unknown socket");
+                exit(1);
+            }
+            printf("Data is ready to be read\n");
+            int recv_len = recvfrom(socket_fd, buffer, RECV_BUFFER_SIZE, 0, (struct sockaddr*)&server_addr, &server_addr_len);
+            if(recv_len > 0){
+                printf("Received %d bytes from server\n", recv_len);
+                printf("Message: %s\n", buffer);
+                process_message(buffer);
+            }else if(recv_len == 0){
+                // UDP should not happen
+            }else{
+                if(errno == EAGAIN || errno == EWOULDBLOCK){
+                    printf("No data to read\n");
                 }else{
-                    if(errno == EAGAIN || errno == EWOULDBLOCK){
-                        printf("No data to read\n");
-                    }else{
-                        perror("recvfrom");
-                        exit(1);
-                    }
+                    perror("recvfrom");
+                    exit(1);
                 }
             }
         }
@@ -100,6 +153,7 @@ int main() {
     }
 #endif
     
-    close(socket_fd);
+    close(socket_primary_fd);
+    close(socket_backup_fd);
     return 0;
 }

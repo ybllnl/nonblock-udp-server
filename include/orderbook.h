@@ -11,8 +11,10 @@
 
 #define MULTICAST_IP_PRIMARY "224.0.0.1"
 #define MULTICAST_IP_BACKUP "224.0.0.2"
-#define MULTICAST_PORT_PRIMARY 12345
-#define MULTICAST_PORT_BACKUP 12346
+#define MULTICAST_PORT_PRIMARY_SENDER 12344
+#define MULTICAST_PORT_PRIMARY_RECEIVER 12345
+#define MULTICAST_PORT_BACKUP_SENDER 12346
+#define MULTICAST_PORT_BACKUP_RECEIVER 12347
 
 uint64_t htonll(uint64_t value){
     return ((uint64_t)htonl(value & 0xFFFFFFFF) << 32) | (htonl(value >> 32));
@@ -217,8 +219,10 @@ public:
     std::queue<CancelOrderLongMessage> cancel_order_message_queue;
     uint64_t next_order_id = 0;
 
-    struct sockaddr_in multicast_primary_addr;
-    struct sockaddr_in multicast_backup_addr;
+    struct sockaddr_in multicast_primary_target_addr;
+    struct sockaddr_in multicast_primary_sender_addr;
+    struct sockaddr_in multicast_backup_target_addr;
+    struct sockaddr_in multicast_backup_sender_addr;
     int primary_socket_fd;
     int backup_socket_fd;
     Exchange(){
@@ -249,24 +253,34 @@ public:
         }
         #endif
 
-        memset(&multicast_primary_addr, 0, sizeof(multicast_primary_addr));
-        multicast_primary_addr.sin_family = AF_INET;
-        multicast_primary_addr.sin_port = htons(MULTICAST_PORT_PRIMARY);
-        multicast_primary_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_PRIMARY);
+        memset(&multicast_primary_target_addr, 0, sizeof(multicast_primary_target_addr));
+        multicast_primary_target_addr.sin_family = AF_INET;
+        multicast_primary_target_addr.sin_port = htons(MULTICAST_PORT_PRIMARY_RECEIVER);
+        multicast_primary_target_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_PRIMARY);
 
-        memset(&multicast_backup_addr, 0, sizeof(multicast_backup_addr));
-        multicast_backup_addr.sin_family = AF_INET;
-        multicast_backup_addr.sin_port = htons(MULTICAST_PORT_BACKUP);
-        multicast_backup_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_BACKUP);
+        memset(&multicast_primary_sender_addr, 0, sizeof(multicast_primary_sender_addr));
+        multicast_primary_sender_addr.sin_family = AF_INET;
+        multicast_primary_sender_addr.sin_port = htons(MULTICAST_PORT_PRIMARY_SENDER);
+        multicast_primary_sender_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_PRIMARY);
+
+        memset(&multicast_backup_target_addr, 0, sizeof(multicast_backup_target_addr));
+        multicast_backup_target_addr.sin_family = AF_INET;
+        multicast_backup_target_addr.sin_port = htons(MULTICAST_PORT_BACKUP_RECEIVER);
+        multicast_backup_target_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_BACKUP);
+
+        memset(&multicast_backup_sender_addr, 0, sizeof(multicast_backup_sender_addr));
+        multicast_backup_sender_addr.sin_family = AF_INET;
+        multicast_backup_sender_addr.sin_port = htons(MULTICAST_PORT_BACKUP_SENDER);
+        multicast_backup_sender_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_BACKUP);
 
         set_non_blocking(primary_socket_fd);
         set_non_blocking(backup_socket_fd);
 
-        if(bind(primary_socket_fd, (struct sockaddr*)&multicast_primary_addr, sizeof(multicast_primary_addr)) < 0){
+        if(bind(primary_socket_fd, (struct sockaddr*)&multicast_primary_sender_addr, sizeof(multicast_primary_sender_addr)) < 0){
             perror("exchange multicast primary bind");
             exit(1);
         }
-        if(bind(backup_socket_fd, (struct sockaddr*)&multicast_backup_addr, sizeof(multicast_backup_addr)) < 0){
+        if(bind(backup_socket_fd, (struct sockaddr*)&multicast_backup_sender_addr, sizeof(multicast_backup_sender_addr)) < 0){
             perror("exchange multicast backup bind");
             exit(1);
         }
@@ -290,9 +304,11 @@ public:
     void send_multicast_messages(){
         while(!add_order_message_queue.empty()){
             AddOrderLongMessage message = add_order_message_queue.front();
+            printf("\tsending message: \n\t\t");
+            message.print();
             message.serialize();
             while(true){
-                ssize_t send_len = sendto(primary_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_primary_addr, sizeof(multicast_primary_addr));
+                ssize_t send_len = sendto(primary_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_primary_target_addr, sizeof(multicast_primary_target_addr));
                 if(send_len < 0){
                     if(errno == EAGAIN || errno == EWOULDBLOCK){
                         continue;
@@ -301,13 +317,15 @@ public:
                     break;
                 }else{
                     printf("exchange send multicast primary success\n");
-                    printf("message:");
+                    printf("\tmessage:\n\t\t");
+                    message.deserialize();
                     message.print();
+                    message.serialize();
                     break;
                 }
             }
             while(true){
-                ssize_t send_len = sendto(backup_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_backup_addr, sizeof(multicast_backup_addr));
+                ssize_t send_len = sendto(backup_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_backup_target_addr, sizeof(multicast_backup_target_addr));
                 if(send_len < 0){
                     if(errno == EAGAIN || errno == EWOULDBLOCK){
                         continue;
@@ -316,7 +334,8 @@ public:
                     break;
                 }else{
                     printf("exchange send multicast backup success\n");
-                    printf("message: ");
+                    printf("\tmessage:\n\t\t");
+                    message.deserialize();
                     message.print();
                     break;
                 }
@@ -330,7 +349,7 @@ public:
             auto& message = cancel_order_message_queue.front();
             message.serialize();
             while(true){
-                ssize_t send_len = sendto(backup_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_backup_addr, sizeof(multicast_backup_addr));
+                ssize_t send_len = sendto(backup_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_backup_target_addr, sizeof(multicast_backup_target_addr));
                 if(send_len < 0){
                     if(errno == EAGAIN || errno == EWOULDBLOCK){
                         continue;
@@ -339,13 +358,14 @@ public:
                     break;
                 }else{
                     printf("exchange send multicast backup success\n");
-                    printf("message: ");
+                    printf("\tmessage:\n\t\t");
+                    message.deserialize();
                     message.print();
                     break;
                 }
             }
             while(true){
-                ssize_t send_len = sendto(primary_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_primary_addr, sizeof(multicast_primary_addr));
+                ssize_t send_len = sendto(primary_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_primary_target_addr, sizeof(multicast_primary_target_addr));
                 if(send_len < 0){
                     if(errno == EAGAIN || errno == EWOULDBLOCK){
                         continue;
@@ -354,7 +374,8 @@ public:
                     break;
                 }else{
                     printf("exchange send multicast primary success\n");
-                    printf("message: ");
+                    printf("\tmessage:\n\t\t");
+                    message.deserialize();
                     message.print();
                     break;
                 }
