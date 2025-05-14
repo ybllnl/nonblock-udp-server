@@ -6,6 +6,9 @@
 #include <random>
 #include <queue>
 #include "network_util.h"
+#include "exchange_ip.h"
+#include <unordered_set>
+
 #define SEND_BUFFER_SIZE 1472
 #define RECV_BUFFER_SIZE 65507
 
@@ -15,6 +18,13 @@
 #define MULTICAST_PORT_PRIMARY_RECEIVER 12345
 #define MULTICAST_PORT_BACKUP_SENDER 12346
 #define MULTICAST_PORT_BACKUP_RECEIVER 12347
+
+const char* get_exchange_ip(){
+    const char* env_ip = getenv("EXCHANGE_IP");
+    return env_ip ? env_ip : DEFAULT_EXCHANGE_IP;
+}
+
+const uint8_t STOCK_NUM = 4;
 
 uint64_t htonll(uint64_t value){
     return ((uint64_t)htonl(value & 0xFFFFFFFF) << 32) | (htonl(value >> 32));
@@ -27,19 +37,19 @@ typedef struct __attribute__((packed)) {
     // in total 232 bits = 29 bytes
     uint16_t Length;
     uint8_t  MessageType;
-    uint32_t TimeOffset;
+    uint64_t TimeOffset;
     uint64_t OrderID;
     char     SideIndicator;
     uint32_t Quantity;
     uint8_t  StockID;
     uint64_t Price;
     void print(){
-        printf("AddOrderLongMessage: Length: %u, MessageType: %u, TimeOffset: %u, OrderID: %lu, SideIndicator: %c, Quantity: %u, StockID: %u, Price: %lu\n", Length, MessageType, TimeOffset, OrderID, SideIndicator, Quantity, StockID, Price);
+        printf("AddOrderLongMessage: Length: %u, MessageType: %u, TimeOffset: %lu, OrderID: %lu, SideIndicator: %c, Quantity: %u, StockID: %u, Price: %lu\n", Length, MessageType, TimeOffset, OrderID, SideIndicator, Quantity, StockID, Price);
     }
 
     void serialize(){
         Length = htons(Length);
-        TimeOffset = htonl(TimeOffset);
+        TimeOffset = htonll(TimeOffset);
         OrderID = htonll(OrderID);
         Quantity = htonl(Quantity);
         Price = htonll(Price);
@@ -47,7 +57,7 @@ typedef struct __attribute__((packed)) {
 
     void deserialize(){
         Length = ntohs(Length);
-        TimeOffset = ntohl(TimeOffset);
+        TimeOffset = ntohll(TimeOffset);
         OrderID = ntohll(OrderID);
         Quantity = ntohl(Quantity);
         Price = ntohll(Price);
@@ -58,21 +68,22 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint16_t Length;
     uint8_t  MessageType;
-    uint32_t TimeOffset;
+    uint64_t TimeOffset;
     uint64_t OrderID;
+    uint8_t StockID;
     void print(){
-        printf("CancelOrderLongMessage: Length: %u, MessageType: %u, TimeOffset: %u, OrderID: %lu\n", Length, MessageType, TimeOffset, OrderID);
+        printf("CancelOrderLongMessage: Length: %u, MessageType: %u, TimeOffset: %lu, OrderID: %lu, StockID: %u\n", Length, MessageType, TimeOffset, OrderID, StockID);
     }
 
     void serialize(){
         Length = htons(Length);
-        TimeOffset = htonl(TimeOffset);
+        TimeOffset = htonll(TimeOffset);
         OrderID = htonll(OrderID);
     }
 
     void deserialize(){
         Length = ntohs(Length);
-        TimeOffset = ntohl(TimeOffset);
+        TimeOffset = ntohll(TimeOffset);
         OrderID = ntohll(OrderID);
     }
 } CancelOrderLongMessage;
@@ -98,6 +109,37 @@ struct Order{
     }
 };
 
+static inline uint64_t get_current_time_offset(){
+    static struct timespec start_time;
+    static bool initialized = false;
+    struct timespec current_time;
+
+    if(!initialized){
+        clock_gettime(CLOCK_MONOTONIC_RAW, &start_time);
+        initialized = true;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &current_time);
+    return (current_time.tv_sec - start_time.tv_sec) * 1000000000 + (current_time.tv_nsec - start_time.tv_nsec);
+}
+
+Order addmessage_to_order(const AddOrderLongMessage& message){
+    Order order;
+    order.stock_id = message.StockID;
+    order.side = message.SideIndicator == 'B' ? Order::Side::Bid : Order::Side::Ask;
+    order.price = message.Price;
+    order.quantity = message.Quantity;
+    order.order_id = message.OrderID;
+    return order;
+}
+
+Order cancelmessage_to_order(const CancelOrderLongMessage& message){
+    Order order;
+    order.stock_id = message.StockID;
+    order.order_id = message.OrderID;
+    return order;
+}
+
 
 // OrderBook is a class that represents the orderbook of a stock
 // exchange logic is not the focus of this project, just make a very simple one.
@@ -114,6 +156,10 @@ public:
     ~OrderBook() = default;
 
     void add_order(const Order& order){
+        if(order.stock_id >= STOCK_NUM){
+            printf("Invalid stock id: %u\n", order.stock_id);
+            return;
+        }
         AddOrderLongMessage message = create_add_order_message(order);
         printf("Adding order: \n\t");
         message.print();
@@ -144,6 +190,7 @@ public:
         message.MessageType = 2;
         message.TimeOffset = 0;
         message.OrderID = order.order_id;
+        message.StockID = stock_id;
         return message;
     }
     void cancel_order(const Order& order){
@@ -209,7 +256,79 @@ public:
 };
 
 
-const int STOCK_NUM = 4;
+
+class ClientExchange{
+public:
+    OrderBook orderbooks[STOCK_NUM];
+    std::unordered_set<uint32_t> processed_order_ids;
+
+    struct sockaddr_in server_addr;
+
+    void add_order(Order& order){
+        if(order.stock_id >= STOCK_NUM){
+            printf("Invalid stock id: %u\n", order.stock_id);
+            return;
+        }
+        orderbooks[order.stock_id].add_order(order);
+    }
+    void cancel_order(const Order& order){
+        orderbooks[order.stock_id].cancel_order(order);
+    }
+
+    ClientExchange(){
+        for(int i = 0; i < STOCK_NUM; i++){
+            orderbooks[i].stock_id = i;
+        }
+
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(SERVER_PORT);
+        server_addr.sin_addr.s_addr = inet_addr(get_exchange_ip());
+        printf("server_addr: %s:%d\n", get_exchange_ip(), SERVER_PORT);
+    }
+
+    void send_order_to_exchange(Order& order, int client_socket_fd){
+        AddOrderLongMessage message = orderbooks[order.stock_id].create_add_order_message(order);
+        message.TimeOffset = get_current_time_offset();
+        printf("sending order: \n\t");
+        message.print();
+        message.serialize();
+        while(true){
+            int send_len = sendto(client_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            if(send_len < 0){
+                if(errno == EAGAIN || errno == EWOULDBLOCK){
+                    continue;
+                }
+                perror("exchange send order");
+                // Capture error details immediately
+                int err = errno;
+                char dest_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &server_addr.sin_addr, dest_ip, sizeof(dest_ip));
+            
+                fprintf(stderr, "Failed to send to %s:%d (socket %d). Error %d: %s\n",
+                       dest_ip,
+                       ntohs(server_addr.sin_port),
+                       client_socket_fd,
+                       err,
+                       strerror(err));
+            
+                // Add specific checks
+                if(err == EACCES) {
+                    fprintf(stderr, "Possible causes:\n"
+                                   "1. Multicast TTL not set (try setsockopt IP_MULTICAST_TTL)\n"
+                                   "2. Firewall blocking UDP port %d\n"
+                                   "3. Binding to privileged port without root\n",
+                                   ntohs(server_addr.sin_port));
+                }
+                break;
+            }else{
+                printf("exchange send order success\n");
+                break;
+            }
+        }
+    }
+
+};
 
 class Exchange{
 public:
@@ -261,7 +380,7 @@ public:
         memset(&multicast_primary_sender_addr, 0, sizeof(multicast_primary_sender_addr));
         multicast_primary_sender_addr.sin_family = AF_INET;
         multicast_primary_sender_addr.sin_port = htons(MULTICAST_PORT_PRIMARY_SENDER);
-        multicast_primary_sender_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_PRIMARY);
+        multicast_primary_sender_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
         memset(&multicast_backup_target_addr, 0, sizeof(multicast_backup_target_addr));
         multicast_backup_target_addr.sin_family = AF_INET;
@@ -271,7 +390,7 @@ public:
         memset(&multicast_backup_sender_addr, 0, sizeof(multicast_backup_sender_addr));
         multicast_backup_sender_addr.sin_family = AF_INET;
         multicast_backup_sender_addr.sin_port = htons(MULTICAST_PORT_BACKUP_SENDER);
-        multicast_backup_sender_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP_BACKUP);
+        multicast_backup_sender_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
         set_non_blocking(primary_socket_fd);
         set_non_blocking(backup_socket_fd);
@@ -304,6 +423,7 @@ public:
     void send_multicast_messages(){
         while(!add_order_message_queue.empty()){
             AddOrderLongMessage message = add_order_message_queue.front();
+            message.TimeOffset = get_current_time_offset();
             printf("\tsending message: \n\t\t");
             message.print();
             message.serialize();
@@ -319,6 +439,7 @@ public:
                     printf("exchange send multicast primary success\n");
                     printf("\tmessage:\n\t\t");
                     message.deserialize();
+                    message.TimeOffset = get_current_time_offset();
                     message.print();
                     message.serialize();
                     break;
@@ -347,6 +468,7 @@ public:
 
         while(!cancel_order_message_queue.empty()){
             auto& message = cancel_order_message_queue.front();
+            message.TimeOffset = get_current_time_offset();
             message.serialize();
             while(true){
                 ssize_t send_len = sendto(backup_socket_fd, &message, sizeof(message), 0, (struct sockaddr*)&multicast_backup_target_addr, sizeof(multicast_backup_target_addr));
@@ -360,7 +482,9 @@ public:
                     printf("exchange send multicast backup success\n");
                     printf("\tmessage:\n\t\t");
                     message.deserialize();
+                    message.TimeOffset = get_current_time_offset();
                     message.print();
+                    message.serialize();
                     break;
                 }
             }
@@ -412,6 +536,5 @@ public:
         add_order(order);
     }
         
-        
-
 };
+

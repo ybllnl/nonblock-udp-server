@@ -4,7 +4,10 @@ project(NonBlockingUDPServer)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(include)
+include_directories(
+    include
+    ${CMAKE_BINARY_DIR}/include
+)
 
 add_executable(server src/server.cpp)
 target_include_directories(server PRIVATE include)
@@ -17,6 +20,12 @@ if(NON_BLOCKING)
     target_compile_definitions(server PRIVATE NON_BLOCKING)
     target_compile_definitions(client PRIVATE NON_BLOCKING)
 endif()
+
+set(EXCHANGE_IP "127.0.0.2" CACHE STRING "Default exchange IP for testing")
+configure_file(
+    "${CMAKE_SOURCE_DIR}/include/exchange_ip.h.in"
+    "${CMAKE_BINARY_DIR}/include/exchange_ip.h"
+)
 
 option(TEST_LOCAL_NETWORK "Test local network" ON)
 
